@@ -7,11 +7,10 @@ import utils
 import cv2
 import argparse
 import time
-
+import json
 import numpy as np
+from image_gen_aux import DepthPreprocessor
 
-from imutils.video import VideoStream
-from midas.model_loader import default_models, load_model
 
 first_execution = True
 def process(device, model, model_type, image, input_size, target_size, optimize, use_camera):
@@ -74,7 +73,7 @@ def process(device, model, model_type, image, input_size, target_size, optimize,
     return prediction
 
 
-def create_side_by_side(image, depth, grayscale):
+def create_side_by_side(image, depth, grayscale, norm=True):
     """
     Take an RGB image and depth map and place them side by side. This includes a proper normalization of the depth map
     for better visibility.
@@ -87,12 +86,12 @@ def create_side_by_side(image, depth, grayscale):
     Returns:
         the image and depth map place side by side
     """
-    depth_min = depth.min()
-    depth_max = depth.max()
-    normalized_depth = 255 * (depth - depth_min) / (depth_max - depth_min)
-    normalized_depth *= 3
 
-    right_side = np.repeat(np.expand_dims(normalized_depth, 2), 3, axis=2) / 3
+    if norm:
+        right_side = np.repeat(np.expand_dims(depth, 2), 3, axis=2) #/ 3
+    else:
+        right_side = np.repeat(np.expand_dims(depth, 2), 3, axis=2) / 3
+    
     if not grayscale:
         right_side = cv2.applyColorMap(np.uint8(right_side), cv2.COLORMAP_INFERNO)
 
@@ -102,7 +101,7 @@ def create_side_by_side(image, depth, grayscale):
         return np.concatenate((image, right_side), axis=1)
 
 
-def run(input_path, output_path, model_path, model_type="dpt_beit_large_512", optimize=False, side=False, height=None,
+def run(input_path, output_path, model_type="depth-anything-large-hf", optimize=False, side=False, height=None,
         square=False, grayscale=False):
     """Run MonoDepthNN to compute depth maps.
 
@@ -123,15 +122,15 @@ def run(input_path, output_path, model_path, model_type="dpt_beit_large_512", op
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device: %s" % device)
 
-    model, transform, net_w, net_h = load_model(device, model_path, model_type, optimize, height, square)
+    # Load depth-anything-large-hf
+    processor = DepthPreprocessor.from_pretrained(model_type)
 
     # get input
-    if input_path is not None:
-        image_names = glob.glob(os.path.join(input_path, "*"))
-        num_images = len(image_names)
-    else:
-        print("No input path specified. Grabbing images from camera.")
+    image_data = json.load(open(input_path))["mixed"]
+    num_images = len(image_data)
+    image_names = [img["prod_img"] for img in image_data if "hed" not in img["prod_img"]]
 
+    multi_prod_names = set(json.load(open(input_path)).get("multi-prod"))
     # create output folder
     if output_path is not None:
         os.makedirs(output_path, exist_ok=True)
@@ -142,65 +141,37 @@ def run(input_path, output_path, model_path, model_type="dpt_beit_large_512", op
         if output_path is None:
             print("Warning: No output path specified. Images will be processed but not shown or stored anywhere.")
         for index, image_name in enumerate(image_names):
-
+            #if not '.'.join(os.path.basename(image_name).split('.')[:-1]) in multi_prod_names:
+            #    continue
             print("  Processing {} ({}/{})".format(image_name, index + 1, num_images))
 
             # input
             original_image_rgb = utils.read_image(image_name)  # in [0, 1]
-            image = transform({"image": original_image_rgb})["image"]
+            # Convert to torch tensor manually (if transform expects tensor)
+            input_tensor = torch.from_numpy(original_image_rgb).permute(2, 0, 1).unsqueeze(0).float().to(device)
+
+            # Apply MiDaS's expected preprocessing
+            input_tensor = torch.nn.functional.interpolate(input_tensor, size=(original_image_rgb.shape[0], original_image_rgb.shape[1]), mode="bicubic", align_corners=False)
 
             # compute
             with torch.no_grad():
-                prediction = process(device, model, model_type, image, (net_w, net_h), original_image_rgb.shape[1::-1],
-                                     optimize, False)
-
+                prediction = processor(input_tensor)
+                prediction = np.asarray(prediction[0])  #(np.asarray(prediction[0]) * 255).astype(np.uint8) ###overflow!!!###
+            
             # output
             if output_path is not None:
                 filename = os.path.join(
-                    output_path, os.path.splitext(os.path.basename(image_name))[0] + '-' + model_type
+                    output_path, os.path.splitext(os.path.basename(image_name))[0] + '-' + model_type.split('/')[-1]
                 )
                 if not side:
-                    utils.write_depth(filename, prediction, grayscale, bits=2)
+                    #utils.write_depth(filename, prediction, grayscale, bits=1)
+                    content = create_side_by_side(None, prediction, grayscale)
+                    cv2.imwrite(filename + ".png", content)
                 else:
                     original_image_bgr = np.flip(original_image_rgb, 2)
                     content = create_side_by_side(original_image_bgr*255, prediction, grayscale)
                     cv2.imwrite(filename + ".png", content)
-                utils.write_pfm(filename + ".pfm", prediction.astype(np.float32))
-
-    else:
-        with torch.no_grad():
-            fps = 1
-            video = VideoStream(0).start()
-            time_start = time.time()
-            frame_index = 0
-            while True:
-                frame = video.read()
-                if frame is not None:
-                    original_image_rgb = np.flip(frame, 2)  # in [0, 255] (flip required to get RGB)
-                    image = transform({"image": original_image_rgb/255})["image"]
-
-                    prediction = process(device, model, model_type, image, (net_w, net_h),
-                                         original_image_rgb.shape[1::-1], optimize, True)
-
-                    original_image_bgr = np.flip(original_image_rgb, 2) if side else None
-                    content = create_side_by_side(original_image_bgr, prediction, grayscale)
-                    cv2.imshow('MiDaS Depth Estimation - Press Escape to close window ', content/255)
-
-                    if output_path is not None:
-                        filename = os.path.join(output_path, 'Camera' + '-' + model_type + '_' + str(frame_index))
-                        cv2.imwrite(filename + ".png", content)
-
-                    alpha = 0.1
-                    if time.time()-time_start > 0:
-                        fps = (1 - alpha) * fps + alpha * 1 / (time.time()-time_start)  # exponential moving average
-                        time_start = time.time()
-                    print(f"\rFPS: {round(fps,2)}", end="")
-
-                    if cv2.waitKey(1) == 27:  # Escape key
-                        break
-
-                    frame_index += 1
-        print()
+                #utils.write_pfm(filename + ".pfm", prediction.astype(np.float32))
 
     print("Finished")
 
@@ -209,28 +180,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument('-i', '--input_path',
-                        default=None,
+                        default="/home/yangmi/AutoLabel/complete_testset.json",
                         help='Folder with input images (if no input path is specified, images are tried to be grabbed '
                              'from camera)'
                         )
 
     parser.add_argument('-o', '--output_path',
-                        default=None,
+                        default="/home/yangmi/s3data/AutoLabel",
                         help='Folder for output images'
                         )
 
     parser.add_argument('-m', '--model_weights',
-                        default=None,
+                        default="/home/yangmi/s3data/Depth_ckpts/dpt_beit_large_512.pt",
                         help='Path to the trained weights of model'
                         )
 
     parser.add_argument('-t', '--model_type',
-                        default='dpt_beit_large_512',
-                        help='Model type: '
-                             'dpt_beit_large_512, dpt_beit_large_384, dpt_beit_base_384, dpt_swin2_large_384, '
-                             'dpt_swin2_base_384, dpt_swin2_tiny_256, dpt_swin_large_384, dpt_next_vit_large_384, '
-                             'dpt_levit_224, dpt_large_384, dpt_hybrid_384, midas_v21_384, midas_v21_small_256 or '
-                             'openvino_midas_v21_small_256'
+                        default='LiheYoung/depth-anything-large-hf',
+                        help='Model type: see https://github.com/asomoza/image_gen_aux.git, '
+                            'Tried: LiheYoung/depth-anything-large-hf, depth-anything/Depth-Anything-V2-Large-hf, depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf' 
                         )
 
     parser.add_argument('-s', '--side',
@@ -264,14 +232,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-
-    if args.model_weights is None:
-        args.model_weights = default_models[args.model_type]
-
     # set torch options
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
 
     # compute depth maps
-    run(args.input_path, args.output_path, args.model_weights, args.model_type, args.optimize, args.side, args.height,
+    run(args.input_path, args.output_path, args.model_type, args.optimize, args.side, args.height,
         args.square, args.grayscale)

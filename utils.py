@@ -105,7 +105,7 @@ def read_image(path):
         array: RGB image (0-1)
     """
     img = cv2.imread(path)
-
+    
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
