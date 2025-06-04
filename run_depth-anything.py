@@ -126,11 +126,15 @@ def run(input_path, output_path, model_type="depth-anything-large-hf", optimize=
     processor = DepthPreprocessor.from_pretrained(model_type)
 
     # get input
-    image_data = json.load(open(input_path))["mixed"]
+    if input_path.endswith(".json"):
+        image_data = json.load(open(input_path))["mixed"]
+        image_names = [img["prod_img"] for img in image_data if "hed" not in img["prod_img"]]
+        multi_prod_names = set(json.load(open(input_path)).get("multi-prod"))
+    else:
+        image_data = glob.glob("/home/yangmi/MiDaS/input/*/*/*.png")
+        image_names = [img_name for img_name in image_data]
     num_images = len(image_data)
-    image_names = [img["prod_img"] for img in image_data if "hed" not in img["prod_img"]]
-
-    multi_prod_names = set(json.load(open(input_path)).get("multi-prod"))
+    
     # create output folder
     if output_path is not None:
         os.makedirs(output_path, exist_ok=True)
@@ -142,11 +146,12 @@ def run(input_path, output_path, model_type="depth-anything-large-hf", optimize=
             print("Warning: No output path specified. Images will be processed but not shown or stored anywhere.")
         for index, image_name in enumerate(image_names):
             #if not '.'.join(os.path.basename(image_name).split('.')[:-1]) in multi_prod_names:
-            #    continue
+            if os.path.isfile(os.path.join(output_path, os.path.basename(image_name))):
+                continue
             print("  Processing {} ({}/{})".format(image_name, index + 1, num_images))
 
             # input
-            original_image_rgb = utils.read_image(image_name)  # in [0, 1]
+            original_image_rgb = utils.read_image(image_name, graynish=127)  # in [0, 1]
             # Convert to torch tensor manually (if transform expects tensor)
             input_tensor = torch.from_numpy(original_image_rgb).permute(2, 0, 1).unsqueeze(0).float().to(device)
 
@@ -161,7 +166,7 @@ def run(input_path, output_path, model_type="depth-anything-large-hf", optimize=
             # output
             if output_path is not None:
                 filename = os.path.join(
-                    output_path, os.path.splitext(os.path.basename(image_name))[0] + '-' + model_type.split('/')[-1]
+                    output_path, os.path.splitext(os.path.basename(image_name))[0] + '-gris' #+ model_type.split('/')[-1]
                 )
                 if not side:
                     #utils.write_depth(filename, prediction, grayscale, bits=1)
@@ -237,5 +242,6 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
 
     # compute depth maps
+    # CUDA_VISIBLE_DEVICES=7 python run_depth-anything.py --output_path /home/yangmi/s3data/AutoLabel/depth-anything-v2/norm_mono_map --model_type "depth-anything/Depth-Anything-V2-Large-hf" --grayscale
     run(args.input_path, args.output_path, args.model_type, args.optimize, args.side, args.height,
         args.square, args.grayscale)

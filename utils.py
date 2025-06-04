@@ -4,6 +4,11 @@ import sys
 import re
 import numpy as np
 import cv2
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+from PIL import PngImagePlugin
+LARGE_ENOUGH_NUMBER = 100
+PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2) # this works
 import torch
 
 
@@ -95,7 +100,36 @@ def write_pfm(path, image, scale=1):
         image.tofile(file)
 
 
-def read_image(path):
+def pad_to_square_np(img_cv, gray_value, dim=1024):
+    h, w = img_cv.shape[:2]
+    new_dim = max(h, w)
+    if new_dim > dim:
+        dim = new_dim
+    top = (dim - h) // 2
+    bottom = dim - h - top
+    left = (dim - w) // 2
+    right = dim - w - left
+
+    # Pad with black (0,0,0)
+    padded_img = cv2.copyMakeBorder(img_cv, top, bottom, left, right,
+                                     borderType=cv2.BORDER_CONSTANT,
+                                     value=(gray_value, gray_value, gray_value))
+
+
+def pad_to_square_pil(img_rgb, gray_value, dim=1024):
+    w, h = img_rgb.size
+    new_dim = max(w, h)
+    if new_dim > dim:
+        dim = new_dim
+    new_img = Image.new("RGB", (dim, dim), (gray_value, gray_value, gray_value))
+    paste_x = (dim - w) // 2
+    paste_y = (dim - h) // 2
+    new_img.paste(img_rgb, (paste_x, paste_y))
+    new_img.resize((1024, 1024))
+    return new_img
+
+
+def read_image(path, graynish):
     """Read image and output RGB image (0-1).
 
     Args:
@@ -104,7 +138,16 @@ def read_image(path):
     Returns:
         array: RGB image (0-1)
     """
-    img = cv2.imread(path)
+    img = Image.open(path).convert("RGBA")
+    # Create a black background image
+    black_bg = Image.new("RGBA", img.size, (graynish, graynish, graynish, graynish))
+    #white_bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    # Composite original image over black background using alpha channel
+    img_rgb = Image.alpha_composite(black_bg, img).convert("RGB")
+    img_rgb = pad_to_square_pil(img_rgb, gray_value=graynish)
+    # Convert to numpy
+    img = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2BGR)
+    #img = cv2.imread(path, cv2.UNCHANGED)
     
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
