@@ -1,7 +1,7 @@
 """Compute depth maps for images in the input folder.
 """
 import os
-import glob
+from glob import glob
 import torch
 import utils
 import cv2
@@ -131,9 +131,13 @@ def run(input_path, output_path, model_type="depth-anything-large-hf", optimize=
         image_names = [img["prod_img"] for img in image_data if "hed" not in img["prod_img"]]
         multi_prod_names = set(json.load(open(input_path)).get("multi-prod"))
     else:
-        image_data = glob.glob("/home/yangmi/MiDaS/input/*/*/*.png")
-        image_names = [img_name for img_name in image_data]
+        #image_data = glob(input_path + "*/*/*.png") + glob(input_path + "*/*.png") # FIXME: please modify!
+        #image_names = [img_name for img_name in image_data if "plain" in img_name or "copy" in img_name]
+        image_data = glob(input_path+"/*.png") + glob(input_path+"/*.jpg")
+        image_names = [img_name for img_name in image_data if "composed" not in img_name]
+        
     num_images = len(image_data)
+    print(image_names)
     
     # create output folder
     if output_path is not None:
@@ -146,12 +150,12 @@ def run(input_path, output_path, model_type="depth-anything-large-hf", optimize=
             print("Warning: No output path specified. Images will be processed but not shown or stored anywhere.")
         for index, image_name in enumerate(image_names):
             #if not '.'.join(os.path.basename(image_name).split('.')[:-1]) in multi_prod_names:
-            if os.path.isfile(os.path.join(output_path, os.path.basename(image_name))):
-                continue
+            #if os.path.isfile(os.path.join(output_path, os.path.basename(image_name))):
+            #    continue
             print("  Processing {} ({}/{})".format(image_name, index + 1, num_images))
-
             # input
-            original_image_rgb = utils.read_image(image_name, graynish=127)  # in [0, 1]
+            #original_image_rgb = utils.read_image(image_name, graynish=0)  # in [0, 1]
+            original_image_rgb = utils.read_image_extended(image_name, graynish=0)
             # Convert to torch tensor manually (if transform expects tensor)
             input_tensor = torch.from_numpy(original_image_rgb).permute(2, 0, 1).unsqueeze(0).float().to(device)
 
@@ -165,9 +169,13 @@ def run(input_path, output_path, model_type="depth-anything-large-hf", optimize=
             
             # output
             if output_path is not None:
-                filename = os.path.join(
-                    output_path, os.path.splitext(os.path.basename(image_name))[0] + '-gris' #+ model_type.split('/')[-1]
-                )
+                #rel_path = os.path.dirname(image_name.split("GiftBox/")[-1])
+                #dst_path = os.path.join(output_path, rel_path)
+                #os.makedirs(dst_path, exist_ok=True)
+                #filename = os.path.join(dst_path, os.path.splitext(os.path.basename(image_name.split("GiftBox")[-1]))[0]+"-bl")
+                filename = os.path.join(output_path, "".join(os.path.basename(image_name).split(".")[:-1])+"-bl")
+                print(f"save to {filename}")
+                
                 if not side:
                     #utils.write_depth(filename, prediction, grayscale, bits=1)
                     content = create_side_by_side(None, prediction, grayscale)

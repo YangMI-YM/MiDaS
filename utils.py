@@ -1,6 +1,8 @@
 """Utils for monoDepth.
 """
 import sys
+from glob import glob
+import os
 import re
 import numpy as np
 import cv2
@@ -10,6 +12,7 @@ from PIL import PngImagePlugin
 LARGE_ENOUGH_NUMBER = 100
 PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2) # this works
 import torch
+from scipy.ndimage import binary_fill_holes
 
 
 def read_pfm(path):
@@ -125,7 +128,7 @@ def pad_to_square_pil(img_rgb, gray_value, dim=1024):
     paste_x = (dim - w) // 2
     paste_y = (dim - h) // 2
     new_img.paste(img_rgb, (paste_x, paste_y))
-    new_img.resize((1024, 1024))
+    new_img.resize((dim, dim))
     return new_img
 
 
@@ -144,7 +147,34 @@ def read_image(path, graynish):
     #white_bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
     # Composite original image over black background using alpha channel
     img_rgb = Image.alpha_composite(black_bg, img).convert("RGB")
-    img_rgb = pad_to_square_pil(img_rgb, gray_value=graynish)
+    img_rgb = pad_to_square_pil(img_rgb, gray_value=graynish, dim=max(img.size))
+    # Convert to numpy
+    img = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2BGR)
+    #img = cv2.imread(path, cv2.UNCHANGED)
+    
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0
+
+    return img
+
+def read_image_extended(path, graynish):
+    """
+        Args:
+        path (str): path to file
+
+    Returns:
+        array: RGB image (0-1)
+    """
+    img = Image.open(path).convert("RGBA")
+    pad_dim = max(img.size) + 500
+    # Create a black background image
+    black_bg = Image.new("RGBA", img.size, (graynish, graynish, graynish, graynish))
+    
+    # Composite original image over black background using alpha channel
+    img_rgb = Image.alpha_composite(black_bg, img).convert("RGB")
+    img_rgb = pad_to_square_pil(img_rgb, gray_value=graynish, dim=pad_dim)
     # Convert to numpy
     img = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2BGR)
     #img = cv2.imread(path, cv2.UNCHANGED)
@@ -240,3 +270,49 @@ def write_depth(path, depth, grayscale, bits=1):
         cv2.imwrite(path + ".png", out.astype("uint16"))
 
     return
+
+
+def quick_mask(rgba_image_path, threshold=1):
+    """
+    Generate a binary mask from an RGBA image.
+    
+    Parameters:
+        rgba_image_path (str): Path to the RGBA image.
+        threshold (int): Alpha threshold to consider a pixel visible (0-255).
+        
+    Returns:
+        mask (np.ndarray): Binary mask (uint8) with 255 for visible, 0 for transparent.
+    """
+    # Load image
+    img = Image.open(rgba_image_path).convert('RGBA')
+    
+    # Convert to NumPy array
+    rgba = np.array(img)
+    
+    # Extract alpha channel
+    ##black_mask = rgba[:,:,:3]==(0,0,0) # rgb
+    ##alpha = np.where(black_mask, 0, 255) # rgb
+    alpha = rgba[:, :, 3] # rgba
+    
+    # Generate mask: 255 for visible, 0 for transparent
+    mask = np.where(alpha >= threshold, 255, 0).astype(np.uint8)
+    
+    # Fill holes
+    ##binary = (mask > 0).any(axis=2).astype(np.uint8) # rgb
+    ##filled = binary_fill_holes(binary).astype(np.uint8) # rgb
+    ##mask = filled * 255 # rgb
+
+    
+    return mask
+
+
+if __name__ == "__main__":
+    input_path = "/home/yangmi/MiDaS/input/PurpleIron/"
+    output_path = "/home/yangmi/MiDaS/output/PurpleIron_mask/"
+    os.makedirs(output_path, exist_ok=True)
+    image_list = glob(input_path + "*.png") + glob(input_path + "*.jpg")
+    image_names = [img for img in image_list if "-bl" not in img]
+
+    for img_name in image_names:
+        visible_mask = quick_mask(img_name)
+        Image.fromarray(visible_mask).save(os.path.join(output_path, ''.join(os.path.basename(img_name).split('.')[:-1])+'.png'))
