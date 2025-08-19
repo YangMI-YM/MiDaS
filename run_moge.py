@@ -7,7 +7,9 @@ from glob import glob
 import torch
 import utils
 import cv2
+import matplotlib.pyplot as plt
 from PIL import Image
+from scipy.interpolate import griddata
 import argparse
 import time
 import json
@@ -23,7 +25,6 @@ from moge.utils.io import save_glb, save_ply
 from moge.utils.vis import colorize_depth, colorize_normal
 from moge.utils.geometry_numpy import depth_occlusion_edge_numpy
 import utils3d
-
 
 
 first_execution = True
@@ -118,6 +119,12 @@ def create_side_by_side(image, depth, grayscale, norm=True):
 def run_moge(input_path, output_path, model_type="v2", optimize=False, side=False, height=None,
         square=False, grayscale=False, use_fp16=True):
     """Run MonoDepthNN to compute depth maps.
+    Terms     |   Description 
+    points    |   (H, W, 3) or (N, 3) array of 3D coordinates. Usually a depth meshgrid converted to world/camera space.
+    vertices  |   Nx3. Each row represents a point (x, y, z) in 3D space that defines the shape of the mesh.
+    faces	  |   Mx3. Each row lists indices into the vertices array, forming a triangle.
+    vertex_uvs|	  Nx2. Array of 2D texture coordinates (u, v) that map each vertex to a pixel in the texture image. Used to apply the texture (color_texture) to the 3D surface.
+    material  |	  Describes how the mesh should look when rendered (color texture, normal maps, metalness, roughness).
 
     Args:
         input_path (str): path to input folder
@@ -139,7 +146,7 @@ def run_moge(input_path, output_path, model_type="v2", optimize=False, side=Fals
     # Load MOGE2
     DEFAULT_PRETRAINED_MODEL_FOR_EACH_VERSION = {
             "v1": "Ruicheng/moge-vitl",
-            "v2": "Ruicheng/moge-2-vitl-normal",
+            "v2": "Ruicheng/moge-2-vitl-normal", # full capacity
     }
     pretrained_model_name_or_path = DEFAULT_PRETRAINED_MODEL_FOR_EACH_VERSION[model_type]
     model = import_model_class_by_version(model_type).from_pretrained(pretrained_model_name_or_path).to(device).eval()
@@ -147,14 +154,14 @@ def run_moge(input_path, output_path, model_type="v2", optimize=False, side=Fals
         model.half()
 
     # get input
-    image_data = glob(input_path+"/*/*.png") + glob(input_path+"/*/*.jpg")
+    image_data = glob(input_path+"/*/*.png") + glob(input_path+"/*/*/*.png") #glob(input_path+"/*.png") + glob(input_path+"/*.jpg") #
     image_names = [img_name for img_name in image_data if "composed" not in img_name and "bl" not in img_name]
         
     num_images = len(image_data)
     print(image_names)
 
     # output options
-    save_maps_ = save_glb_ = save_ply_ = True
+    save_maps_ = save_glb_ = save_ply_ = save_npz_ = True
     show = False
     fov_x_ = None
     resolution_level = 9
@@ -190,8 +197,8 @@ def run_moge(input_path, output_path, model_type="v2", optimize=False, side=Fals
             output = model.infer(image_tensor, fov_x=fov_x_, resolution_level=resolution_level, num_tokens=num_tokens, use_fp16=use_fp16)
             points, depth, mask, intrinsics = output['points'].cpu().numpy(), output['depth'].cpu().numpy(), output['mask'].cpu().numpy(), output['intrinsics'].cpu().numpy()
             normal = output['normal'].cpu().numpy() if 'normal' in output else None
-
-            save_path = Path(output_path, "".join(os.path.basename(image_name).split(".")[:-1]))
+            save_path = Path("".join(image_name.split(".")[:-1]).replace(input_path, output_path))
+            #save_path = Path(output_path, "".join(os.path.basename(image_name).split(".")[:-1]))
             save_path.mkdir(exist_ok=True, parents=True)
             
             # Save images / maps
@@ -245,6 +252,58 @@ def run_moge(input_path, output_path, model_type="v2", optimize=False, side=Fals
             if save_ply_:
                 save_ply(save_path / 'pointcloud.ply', vertices, np.zeros((0, 3), dtype=np.int32), vertex_colors, vertex_normals)
 
+            if save_npz_:
+                height, width, _ = image.shape
+                points = vertex_uvs * [width - 1, height - 1]  # UV in pixel space
+                values = vertices[:, 2]          # Z values, or any per-vertex scalar
+
+                # Create regular grid
+                grid_x, grid_y = np.meshgrid(
+                    np.linspace(0, width - 1, width),
+                    np.linspace(0, height - 1, height)
+                )
+                # Interpolate Z onto the grid
+                grid_z = griddata(points, values, (grid_x, grid_y), method='cubic')
+                #print(grid_z[0][0], "nan") 
+                grid_z[~np.flipud(mask)] = np.nan
+
+                np.savez_compressed(save_path / 'vertices_cache.npz', X=grid_x,Y=grid_y,Z=grid_z,metadata=np.array([width, height]))
+
+                x = np.linspace(-1, 1, width)
+                y = np.linspace(-1, 1, height)
+                X, Y = np.meshgrid(x, y)
+                
+                # Create structured grid points
+                y_coords = np.arange(height)
+                x_coords = np.arange(width)
+                X_coords, Y_coords = np.meshgrid(x_coords, y_coords)
+                points = np.column_stack((X_coords.ravel(), Y_coords.ravel()))
+                values = cv2.cvtColor(colorize_depth(depth), cv2.COLOR_RGB2GRAY).ravel()
+
+                # Normalize coordinates for interpolation
+                points = points / [width-1, height-1] * 2 - 1
+                grid_points = np.column_stack((X.ravel(), Y.ravel()))
+
+                Z = griddata(points, values, grid_points, method="cubic")
+                Z = Z.reshape(height, width)
+                Z[~mask] = 255
+
+                np.savez_compressed(save_path / 'depth_cache.npz', X=X,Y=Y,Z=Z,metadata=np.array([width, height]))
+
+                fig, axes = plt.subplots(1, 2, figsize=(16, 12))
+                plt.subplot(1, 2, 1)
+                plt.imshow(grid_z, cmap='hot', origin='lower')
+                plt.title("Interpolated Z from UV → Depth Map")
+                plt.colorbar(label='Z (depth)')
+                plt.axis('off')
+                plt.subplot(1, 2, 2)
+                plt.imshow(Z, cmap='hot')
+                plt.title("Interpolated Z from depth vis")
+                plt.colorbar(label='Z (depth)')
+                plt.axis('off')
+                plt.savefig(save_path / 'InterpolatedZ.png', transparent=True, dpi=300)
+                plt.close()
+
     print("Finished")
 
 
@@ -263,14 +322,14 @@ if __name__ == "__main__":
                         )
 
     parser.add_argument('-m', '--model_weights',
-                        default="/home/yangmi/s3data/Depth_ckpts/dpt_beit_large_512.pt",
+                        default=None,
                         help='Path to the trained weights of model'
                         )
 
     parser.add_argument('-t', '--model_type',
                         default='LiheYoung/depth-anything-large-hf',
-                        help='Model type: see https://github.com/asomoza/image_gen_aux.git, '
-                            'Tried: LiheYoung/depth-anything-large-hf, depth-anything/Depth-Anything-V2-Large-hf, depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf' 
+                        help='Model type: see https://github.com/microsoft/MoGe.git, '
+                            'Tried: Ruicheng/moge-2-vitl, Ruicheng/moge-2-vitl-normal. Note: moge-2-vitl-normal has full capabilities' 
                         )
 
     parser.add_argument('-s', '--side',
@@ -309,7 +368,6 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
 
     # compute depth maps
-    # CUDA_VISIBLE_DEVICES=4 python run_moge.py --input /home/yangmi/s3data/flux-pipeline/bg_fixed_pipe_steps/step_22/903b0ec6-9805-4767-a4f9-e60b49c3 \
-    # 560c/42be80b1-5c54-42c6-aff3-1d78f13a1a17/af769ded-7d9f-4710-af22-0b1bc4395886 --output_path  /home/yangmi/s3data/AutoLabel/MoGe-2/reflective_surface --model_type "v2" --grayscale
+    # CUDA_VISIBLE_DEVICES=0 python run_moge.py --input required --output_path required --model_type "v2" --grayscale
     run_moge(args.input_path, args.output_path, args.model_type, args.optimize, args.side, args.height,
         args.square, args.grayscale)
