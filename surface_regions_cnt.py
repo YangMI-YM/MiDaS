@@ -55,6 +55,12 @@ def load_mask_file(filepath):
     
     return mask_bool
 
+def load_image(filepath):
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
+    img = cv2.imread(filepath)
+    return img
+
 def classify_shape(contour):
     approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
     num_vertices = len(approx)
@@ -70,21 +76,49 @@ def classify_shape(contour):
 
     return shape_type, approx
 
-def scale_polygon(polygon: np.ndarray, scale: float = 1.75) -> np.ndarray:
+def scale_polygon(polygon, image_shape, scale=1.75, max_iter=20, shrink_step=0.95):
     # polygon: (N, 1, 2) or (N, 2)
+    # fully-contained, zoomed, 4-vertrice (quadrilateral)
     if polygon.ndim == 3:
         polygon = polygon.squeeze(1)
 
-    centroid = polygon.mean(axis=0)
-    scaled = centroid + scale * (polygon - centroid)
+    # Step 1: create mask from original polygon
+    mask = np.zeros(image_shape, dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], 255)
+
+    # Step 2: get min area rect
+    rect = cv2.minAreaRect(polygon.astype(np.float32))  # ((cx, cy), (w, h), angle)
+    box = cv2.boxPoints(rect).astype(np.int32)
+
+    # Step 3: check containment and shrink if needed
+    for _ in range(max_iter):
+        test_mask = np.zeros_like(mask)
+        cv2.fillPoly(test_mask, [box.astype(np.int32)], 255)
+
+        # Check if box is fully inside the original polygon mask
+        inside = cv2.bitwise_and(mask, test_mask)
+        area_test = cv2.countNonZero(test_mask)
+        area_inside = cv2.countNonZero(inside)
+
+        if area_inside == area_test:
+            centroid = np.mean(box, axis=0)
+            scaled = centroid + scale * (box - centroid)
+            return scaled.astype(np.int32)  # box is fully inside
+
+        # Shrink the rectangle around center
+        centroid = np.mean(box, axis=0)
+        box = centroid + shrink_step * (box - centroid)
+    
+    centroid = np.mean(box, axis=0)
+    scaled = centroid + scale * (box - centroid)
     return scaled.astype(np.int32)
 
-def extract_roi_data(contours):
+def extract_roi_data(contours, image_shape):
     results = []
     for cnt in contours:
         shape_type, polygon = classify_shape(cnt)
         #x, y, w, h = cv2.boundingRect(cnt)
-        zoomed_polygon = scale_polygon(polygon, scale=0.75)
+        zoomed_polygon = scale_polygon(polygon, image_shape, scale=0.75)
         results.append({
             "shape": shape_type,
             #"bbox": [int(x), int(y), int(w), int(h)],
@@ -92,6 +126,29 @@ def extract_roi_data(contours):
             "polygon": polygon.squeeze().tolist() if polygon.ndim == 3 else []
         })
     return results
+
+def sharpen_image(image):
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5,-1],
+                       [0, -1, 0]])
+    sharpened = cv2.filter2D(image, -1, kernel)
+    return sharpened
+
+def gamma_correction(image, gamma=1.5):
+    invGamma = 1.0 / gamma
+    table = np.array([
+        ((i / 255.0) ** invGamma) * 255
+        for i in np.arange(256)
+    ]).astype("uint8")
+    return cv2.LUT(image, table)
+
+def detect_contours(masked_img, min_area=1e4):
+    sharpen = sharpen_image(masked_img.astype(np.uint8))
+    gray = cv2.cvtColor(sharpen, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
 
 def split_surface_regions(normals, mask, threshold=0.0):
     """
@@ -259,10 +316,9 @@ def find_corner_points(normals, regions, mask):
         # Sort contours by area and get the 2 largest
         if contour_areas:
             sorted_indices = np.argsort(contour_areas)[::-1]  # Descending order
-            largest_2_indices = sorted_indices[:2]    
-            print(f"largest_2_indices: {largest_2_indices}")
+            largest_2_indices = sorted_indices[:2]
+            detections = []
             # find contours in original normal
-            most_rectangular_contours = []
             for i, idx in enumerate(largest_2_indices):
                 contour = all_contours[idx]
                 area = contour_areas[idx]
@@ -273,56 +329,27 @@ def find_corner_points(normals, regions, mask):
                 normal_seg = np.stack([normals['R'], normals['G'], normals['B']], axis=2)
                 normal_seg = ((normal_seg + 1) / 2) * 255 # normalize to [0, 255]
                 normal_seg[contour_mask==0] = 0
-                normal_seg = cv2.cvtColor(normal_seg.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-                #cv2.imwrite(f"./normal_seg_{i}.png", normal_seg)
-                
-                normal_cnts, _ = cv2.findContours(normal_seg, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-                most_rectangular_contour = None
-                best_rectangularity = 0
-                
+                #img_seg = image.copy()
+                #img_seg[contour_mask==0] = 0
+                #cv2.imwrite(f"./img_seg{i}.png", img_seg)
+                normal_cnts = detect_contours(normal_seg)
                 if normal_cnts:
-                    for normal_cnt in normal_cnts:
-                        plane_area = cv2.contourArea(normal_cnt)
-                        if plane_area > 100:  # Filter out very small contours
-                            # Find minimum bounding rectangle
-                            region_rect = cv2.minAreaRect(normal_cnt)
-                            rect_area = region_rect[1][0] * region_rect[1][1]
-                            
-                            if rect_area > 0:
-                                # Calculate rectangularity (contour area / rectangle area)
-                                rectangularity = plane_area / rect_area
-                                
-                                # Also consider aspect ratio
-                                aspect_ratio = max(region_rect[1]) / min(region_rect[1]) if min(region_rect[1]) > 0 else float('inf')
-                                
-                                # Combined score: rectangularity + bonus for reasonable aspect ratio
-                                score = rectangularity
-                                if 0.5 <= aspect_ratio <= 2.0:  # Reasonable aspect ratio
-                                    score += 0.1
-                                
-                                if score > best_rectangularity:
-                                    best_rectangularity = score
-                                    most_rectangular_contour = normal_cnt
-                    most_rectangular_contours.append(most_rectangular_contour)
+                    detections += extract_roi_data(normal_cnts, mask.shape)
     
-    #print(most_rectangular_contours)
-    return combined_x_canvas, most_rectangular_contours
+    print(largest_2_indices, detections)
+    return combined_x_canvas, detections
 
-def visualize_regions(normals, regions, x_comb, pinpoints):
+def visualize_regions(normals, x_comb, pinpoints):
     """
     Visualize the original normals, mask, and hierarchical regions.
     """
-    fig, axes = plt.subplots(3, 3, figsize=(16, 12))
-    fig.suptitle('Hierarchical Surface Region Analysis (Y→X)', fontsize=16)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 12))
+    fig.suptitle('Surface Region Analysis', fontsize=16)
 
     # Original normal maps
-    axes[0, 0].imshow(normals['B'], cmap='RdBu_r', vmin=-1, vmax=1)
-    axes[0, 0].set_title('X Normal (B)')
-    axes[0, 0].axis('off')
-    
-    axes[0, 1].imshow(normals['G'], cmap='RdBu_r', vmin=-1, vmax=1)
-    axes[0, 1].set_title('Y Normal (G)')
-    axes[0, 1].axis('off')
+    axes[0].imshow(normals['B'], cmap='RdBu_r', vmin=-1, vmax=1)
+    axes[0].set_title('X Normal (Ch=B)')
+    axes[0].axis('off')
     
     # Mask visualization
     # Combined normals visualization
@@ -332,15 +359,17 @@ def visualize_regions(normals, regions, x_comb, pinpoints):
     pinpts_normals = combined_normals.copy()
     pinpts_normals = pinpts_normals.astype(np.uint8)
     for pinpoint in pinpoints:
-        cv2.drawContours(pinpts_normals, [pinpoint], -1, (255, 0, 0), 2)
+        cv2.polylines(pinpts_normals, [np.array(pinpoint["polygon"], dtype=np.int32)], isClosed=True, color=(0, 0, 255), thickness=2)
+        cv2.polylines(pinpts_normals, [pinpoint["zoomed_polygon"]], isClosed=True, color=(255, 0, 0), thickness=2)
+        #cv2.drawContours(pinpts_normals, [np.array(pinpoint["polygon"], dtype=np.int32)], -1, (255, 0, 0), 2)
 
-    axes[0, 2].imshow(pinpts_normals)
-    axes[0, 2].set_title('Normal, Plane, Pinpoints')
-    axes[0, 2].axis('off')
+    axes[1].imshow(pinpts_normals)
+    axes[1].set_title('Normal, Plane, Pinpoints')
+    axes[1].axis('off')
 
-    axes[1, 0].imshow(x_comb, cmap='Reds', alpha=0.8)
-    axes[1, 0].set_title('All X Regions Combined')
-    axes[1, 0].axis('off')
+    axes[2].imshow(x_comb, cmap='Reds', alpha=0.8)
+    axes[2].set_title('Regions with Color Labels')
+    axes[2].axis('off')
 
     plt.tight_layout()
     # Save the plot as PNG
@@ -351,6 +380,7 @@ def visualize_regions(normals, regions, x_comb, pinpoints):
 def main():
     """Main function to run the surface split analysis."""
     # File path
+    #img = load_image("/home/yangmi/s3data/AutoLabel/MoGe-2/PotDeMiel/小蜜罐-俯4/image.jpg")
     normals = load_exr_file("/home/yangmi/s3data/AutoLabel/MoGe-2/PotDeMiel/小蜜罐-俯4/normal.exr")
     mask = load_mask_file("/home/yangmi/s3data/AutoLabel/MoGe-2/PotDeMiel/小蜜罐-俯4/mask.png")
 
@@ -365,7 +395,7 @@ def main():
     #largest_regions = find_largest_regions(regions, mask, n_largest=3)
     combined_x_canvas, likely_pinpts = find_corner_points(normals, regions, mask)
 
-    visualize_regions(normals, regions, combined_x_canvas, likely_pinpts)
+    visualize_regions(normals, combined_x_canvas, likely_pinpts)
 
 if __name__ == "__main__":
     main() 
