@@ -8,6 +8,8 @@ import cv2
 from scipy import ndimage
 from sklearn.cluster import DBSCAN
 import os
+from glob import glob
+
 
 def load_exr_file(filepath):
     """Load EXR file and return RGB channels as numpy arrays."""
@@ -82,6 +84,11 @@ def scale_polygon(polygon, image_shape, scale=1.75, max_iter=20, shrink_step=0.9
     if polygon.ndim == 3:
         polygon = polygon.squeeze(1)
 
+    if polygon.shape[0] == 4:
+        centroid = polygon.mean(axis=0)
+        scaled = centroid + scale * (polygon - centroid)
+        return scaled.astype(np.int32)
+
     # Step 1: create mask from original polygon
     mask = np.zeros(image_shape, dtype=np.uint8)
     cv2.fillPoly(mask, [polygon], 255)
@@ -142,18 +149,90 @@ def gamma_correction(image, gamma=1.5):
     ]).astype("uint8")
     return cv2.LUT(image, table)
 
+def normalize_normals(normals):
+    # normals: H x W (x ch)
+    if normals.ndim == 3:
+        norm = np.linalg.norm(normals, axis=2, keepdims=True) + 1e-8
+    else:
+        norm = np.linalg.norm(normals) + 1e-8
+    return normals / norm
+
+def compute_normal_smoothness(normal_channel, mask=None):
+    if normal_channel.ndim == 2:
+        normal_channel = np.expand_dims(normal_channel, axis=-1)
+    normals = normalize_normals(normal_channel)
+
+    # Shifted normals to compare with neighbors (right and bottom)
+    dx = normals[:, 1:, :] - normals[:, :-1, :]
+    dy = normals[1:, :, :] - normals[:-1, :, :]
+
+    # Compute angle change = norm of the vector difference
+    dx_mag = np.linalg.norm(dx, axis=2)
+    dy_mag = np.linalg.norm(dy, axis=2)
+
+    # Combine and pad to match original size
+    grad_mag = np.zeros(normals.shape[:2])
+    grad_mag[:, :-1] += dx_mag
+    grad_mag[:-1, :] += dy_mag
+    grad_mag /= 2.0
+
+    if mask is not None:
+        grad_mag = grad_mag[mask > 0]
+
+    # Inverse of mean angular gradient = smoothness
+    return 1.0 / (np.mean(grad_mag) + 1e-5)
+
+def compute_local_variance(channel, mask=None, kernel_size=5):
+    """
+    Compute the variance of intensities by patches
+    Returns: smoothness where higher is smoother
+    """
+    blurred = cv2.blur(channel.astype(np.float32), (kernel_size, kernel_size))
+    squared = cv2.blur(channel.astype(np.float32)**2, (kernel_size, kernel_size))
+    local_variance = squared - blurred**2
+
+    if mask is not None:
+        local_variance = local_variance[mask > 0]
+
+    return 1.0 / (np.mean(local_variance) + 1e-5)  
+
+def safe_find_edge_contours(image, mode=cv2.RETR_LIST, method=cv2.CHAIN_APPROX_NONE, min_area=1e4):
+    # Step 1: pad image to avoid border-touching issues
+    image = cv2.dilate(image, None, iterations=2)
+    padded = cv2.copyMakeBorder(image, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+
+    # Step 2: find contours
+    contours, hierarchy = cv2.findContours(padded, mode, method)
+
+    # Step 3: remove the padding offset (subtract 1 from all coordinates)
+    return [cnt - 1 for cnt in contours if cv2.contourArea(cnt) > min_area]
+
+def safe_find_mask_contours(image, mode=cv2.RETR_LIST, method=cv2.CHAIN_APPROX_NONE, min_area=1e4):
+    # Step 1: pad image to avoid border-touching issues
+    padded = cv2.copyMakeBorder(image, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+
+    # Step 2: find contours
+    contours, hierarchy = cv2.findContours(padded, mode, method)
+
+    # Step 3: remove the padding offset (subtract 1 from all coordinates)
+    return [cnt - 1 for cnt in contours if cv2.contourArea(cnt) > min_area]
+
 def detect_contours(masked_img, min_area=1e4):
     sharpen = sharpen_image(masked_img.astype(np.uint8))
     gray = cv2.cvtColor(sharpen, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(blur, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    return [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
+    contours = safe_find_edge_contours(edges, min_area=min_area*4) #cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        contours = safe_find_mask_contours(blur, min_area=min_area)
+    return contours
 
-def split_surface_regions(normals, mask, threshold=0.0):
+def split_surface_regions(normals, mask, threshold=0.0, smooth_thres=100):
     """
+    Front: [Y] (near-zero or smooth transition)
+    Side: [Y, X]
+    Top view: [X]
     Split surface normal regions hierarchically: first by Y direction, then each Y region by X direction.
-    Only considers masked regions.
     
     Args:
         normals: Dictionary with 'R', 'G', 'B' channels (z, y, x normals)
@@ -168,12 +247,13 @@ def split_surface_regions(normals, mask, threshold=0.0):
     
     # Step 1: Split by Y direction (G channel) first
     y_regions = np.zeros_like(normals['G'], dtype=int)
-    y_regions[valid_mask & (normals['G'] < -threshold)] = 1      # Negative Y
-    y_regions[valid_mask & (normals['G'] > threshold)] = 2       # Positive Y
-    y_regions[valid_mask & (np.abs(normals['G']) <= threshold)] = 3  # Near zero Y
+    y_regions[valid_mask & (normals['G'] < -threshold)] = 1      # Negative Y (Upward)
+    y_regions[valid_mask & (normals['G'] > threshold)] = 2       # Positive Y (Downward)
+    y_regions[valid_mask & (np.abs(normals['G']) <= threshold)] = 3  # Near zero (Front/edge/reflection)
     regions['y'] = y_regions
+    #cv2.imwrite("./y_regions.png", (y_regions*80).astype(np.uint8))
     
-    # Step 2: For each Y region, split by X direction (R channel)
+    # Step 2: For each Y region, compute smoothness then (optional) split by X direction (R channel)
     regions['hierarchical'] = {}
     
     # Get unique Y region labels (excluding 0 which is background)
@@ -182,14 +262,20 @@ def split_surface_regions(normals, mask, threshold=0.0):
     
     for y_label in y_labels:
         y_mask = (y_regions == y_label)
-        
-        # Create X regions within this Y region
+        # Step 2.1: Compute smoothness
+        smoothness = compute_normal_smoothness(normals['B'], y_mask)
+        print(f"local gradient smoothness on y_{y_label}", smoothness)    
+        # Step 2.2: Create X regions within this Y region
         x_regions = np.zeros_like(normals['B'], dtype=int)
-        x_regions[y_mask & (normals['B'] < -threshold)] = 1      # Negative X
-        x_regions[y_mask & (normals['B'] > threshold)] = 2       # Positive X
-        x_regions[y_mask & (np.abs(normals['B']) <= threshold)] = 3  # Near zero X
+        if smoothness < smooth_thres:
+            x_regions[y_mask] = 3 # flat
+        else:
+            x_regions[y_mask & (normals['B'] < -threshold)] = 1      # Negative X (Left)
+            x_regions[y_mask & (normals['B'] > threshold)] = 2       # Positive X (Right)
+            x_regions[y_mask & (np.abs(normals['B']) <= threshold)] = 3  # Near zero X (Flat)
         
         regions['hierarchical'][f'y{y_label}'] = x_regions
+    
     
     return regions
 
@@ -295,9 +381,10 @@ def find_corner_points(normals, regions, mask):
             # Get unique X region values (excluding 0 which is background)
             unique_x_values = np.unique(x_regions_masked)
             unique_x_values = unique_x_values[unique_x_values > 0]
-            
+            print("find corner points", y_key, unique_x_values)
             for region_value in unique_x_values:
                 region_mask = (x_regions_masked == region_value).astype(np.uint8)
+                #cv2.imwrite(f"./region_mask_{y_key}-{region_value}.png", region_mask*255)
                 all_x_regions.append(region_mask)
                 combined_x_canvas += region_mask * len(all_x_regions)
 
@@ -331,19 +418,19 @@ def find_corner_points(normals, regions, mask):
                 normal_seg[contour_mask==0] = 0
                 #img_seg = image.copy()
                 #img_seg[contour_mask==0] = 0
-                #cv2.imwrite(f"./img_seg{i}.png", img_seg)
+                #cv2.imwrite(f"./normal_seg{i}.png", normal_seg)
                 normal_cnts = detect_contours(normal_seg)
                 if normal_cnts:
                     detections += extract_roi_data(normal_cnts, mask.shape)
     
-    print(largest_2_indices, detections)
+    print(largest_2_indices, len(normal_cnts), detections)
     return combined_x_canvas, detections
 
-def visualize_regions(normals, x_comb, pinpoints):
+def visualize_regions(normals, x_comb, pinpoints, output_path):
     """
     Visualize the original normals, mask, and hierarchical regions.
     """
-    fig, axes = plt.subplots(1, 3, figsize=(16, 12))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 6))
     fig.suptitle('Surface Region Analysis', fontsize=16)
 
     # Original normal maps
@@ -373,16 +460,14 @@ def visualize_regions(normals, x_comb, pinpoints):
 
     plt.tight_layout()
     # Save the plot as PNG
-    output_filename = 'surface_region_analysis.png'
-    plt.savefig(output_filename, dpi=300, bbox_inches='tight', facecolor='white')
-    print(f"Plot saved as: {output_filename}")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"Plot saved as: {output_path}")
 
-def main():
+def demo(test_sample, output_path):
     """Main function to run the surface split analysis."""
     # File path
-    #img = load_image("/home/yangmi/s3data/AutoLabel/MoGe-2/PotDeMiel/小蜜罐-俯4/image.jpg")
-    normals = load_exr_file("/home/yangmi/s3data/AutoLabel/MoGe-2/PotDeMiel/小蜜罐-俯4/normal.exr")
-    mask = load_mask_file("/home/yangmi/s3data/AutoLabel/MoGe-2/PotDeMiel/小蜜罐-俯4/mask.png")
+    normals = load_exr_file(os.path.join(test_sample, "normal.exr"))
+    mask = load_mask_file(os.path.join(test_sample, "mask.png"))
 
     if mask.shape != normals['R'].shape:
         raise ValueError(f"Mask shape {mask.shape} does not match normal map shape {normals['R'].shape}")
@@ -392,10 +477,22 @@ def main():
     mask_coverage = (valid_pixels / total_pixels) * 100
 
     regions = split_surface_regions(normals, mask, threshold=0.1)
-    #largest_regions = find_largest_regions(regions, mask, n_largest=3)
     combined_x_canvas, likely_pinpts = find_corner_points(normals, regions, mask)
 
-    visualize_regions(normals, combined_x_canvas, likely_pinpts)
+    visualize_regions(normals, combined_x_canvas, likely_pinpts, output_path)
 
 if __name__ == "__main__":
-    main() 
+    testset = glob("/home/yangmi/s3data/AutoLabel/MoGe-2/PotDeMiel/*/normal.exr") + \
+              glob("/home/yangmi/s3data/AutoLabel/MoGe-2/PurpleIron/*/normal.exr") + \
+              glob("/home/yangmi/s3data/AutoLabel/MoGe-2/GiftBox/正侧俯/*/normal.exr") + \
+              glob("/home/yangmi/s3data/AutoLabel/MoGe-2/GiftBox/正侧俯/*/*/normal.exr") + \
+              glob("/home/yangmi/s3data/AutoLabel/MoGe-2/crV-产品图/*/*/normal.exr")
+    output_dir = "/home/yangmi/s3data/AutoLabel/init_corner_pts"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for test_sample in testset:
+        #if "/home/yangmi/s3data/AutoLabel/MoGe-2/GiftBox/正侧俯/PNG/图层 24 " not in test_sample:
+        #    continue
+        output_path = test_sample.replace("MoGe-2", "init_corner_pts").replace("/normal.exr", ".png")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        demo(test_sample=os.path.dirname(test_sample), output_path=output_path) 
